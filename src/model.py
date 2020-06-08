@@ -9,15 +9,8 @@ import torch.nn.functional as F
 
 import numpy as np
 
-import pytorch_lightning as pl
-from collections import OrderedDict
-import warnings
-warnings.filterwarnings('ignore')
-
-
-torch.set_default_tensor_type('torch.FloatTensor')
 bias=True
-
+torch.set_default_dtype(torch.float)
 class discriminator_model(nn.Module):
 
   def __init__(self):
@@ -46,7 +39,7 @@ class colorization_model(nn.Module):
   def __init__(self):
     super(colorization_model, self).__init__()
 
-    self.VGG_model = torchvision.models.vgg16(pretrained=True).float()
+    self.VGG_model = torchvision.models.vgg16(pretrained=True)
     self.VGG_model = nn.Sequential(*list(self.VGG_model.features.children())[:-8]) #[None, 512, 28, 28]
     self.relu = nn.ReLU()
     self.lrelu = nn.LeakyReLU(0.3)
@@ -94,7 +87,7 @@ class colorization_model(nn.Module):
 
     # VGG Without Top Layers
 
-    vgg_out = self.VGG_model(input_img.float())
+    vgg_out = self.VGG_model(input_img)
 
     #Global Features
     
@@ -149,141 +142,6 @@ class colorization_model(nn.Module):
 
     return outputmodel, global_featureClass
 
-
-class GAN(pl.LightningModule):
-  def __init__(self, hparams):
-    super(GAN, self).__init__()
-    self.hparams = hparams
-
-    self.netG = colorization_model()
-    self.netD = discriminator_model()
-    self.VGG_MODEL = torchvision.models.vgg16(pretrained=True).float()
-
-    self.generated_imgs = None
-    self.last_imgs = None
-
-  def forward(self, input):
-
-    self.predAB, self.classVector = self.netG(input)
-    return self.predAB, self.classVector
-
-
-  def wgan_loss(self, prediction, real_or_not):
-    if real_or_not:
-      return -torch.mean(prediction)
-    else:
-      return torch.mean(prediction)
-  
-  def gp_loss(self, y_pred, averaged_samples, gradient_penalty_weight):
-
-    gradients = torch.autograd.grad(y_pred,averaged_samples,
-                              grad_outputs=torch.ones(y_pred.size()),
-                              create_graph=True, retain_graph=True, only_inputs=True)[0]
-    gradients = gradients.view(gradients.size(0), -1)
-    gradient_penalty = (((gradients).norm(2, dim=1) - 1) ** 2).mean() * gradient_penalty_weight
-    return gradient_penalty
-
-  def training_step(self, batch, batch_idx, optimizer_idx):
-    trainL, trainAB, _ = batch
-
-    trainL_3 = torch.tensor(np.tile(trainL, [1,3,1,1])).float()
-    trainL = torch.tensor(trainL).float()
-    trainAB = torch.tensor(trainAB).float()
-
-    predictVGG = F.softmax(self.VGG_MODEL(trainL_3))
-    
-    if optimizer_idx == 0:
-
-      predAB, classVector = self(trainL_3)
-      predLAB = torch.cat([trainL, predAB], dim=1)
-      discpred = self.netD(predLAB)
-
-      Loss_KLD = nn.KLDivLoss(size_average='False')(classVector.log(), predictVGG.detach()) * 0.003
-      Loss_MSE = nn.MSELoss()(predAB, trainAB)
-      Loss_WL = self.wgan_loss(discpred, True) * 0.1 
-      Loss_G = Loss_KLD + Loss_MSE + Loss_WL
-
-      tqdm_dict = {'Loss_G': Loss_G}
-      output = OrderedDict({
-          'loss': Loss_G,
-          'progress_bar': tqdm_dict,
-          'log': tqdm_dict
-      })
-      
-      return output
-
-    if optimizer_idx == 1:
-      predLAB = torch.cat([trainL, self.predAB], dim=1)
-      discpred = self.netD(predLAB.detach())
-      realLAB = torch.cat([trainL, trainAB], dim=1)
-      discreal = self.netD(realLAB)
-
-      weights = torch.randn((trainAB.size(0),1,1,1))      
-      if self.on_gpu:
-        weights = weights.cuda(trainAB.device.index)    
-      averaged_samples = (weights * trainAB ) + ((1 - weights) * self.predAB.detach())
-      averaged_samples = torch.autograd.Variable(averaged_samples, requires_grad=True)
-      avg_img = torch.cat([trainL, averaged_samples], dim=1)
-      discavg = self.netD(avg_img)
-
-      Loss_D_Fake = self.wgan_loss(discpred, False)
-      Loss_D_Real = self.wgan_loss(discreal, True)
-      Loss_D_avg = self.gp_loss(discavg, averaged_samples, config.GRADIENT_PENALTY_WEIGHT)
-      Loss_D = Loss_D_Fake + Loss_D_Real + Loss_D_avg
-
-      tqdm_dict = {'Loss_D': Loss_D}
-      output = OrderedDict({
-          'loss': Loss_D,
-          'progress_bar': tqdm_dict,
-          'log': tqdm_dict
-      })
-      return output
-  def configure_optimizers(self):
-    lr = self.hparams.lr
-    b1 = self.hparams.b1
-    b2 = self.hparams.b2
-
-    optG = torch.optim.Adam(self.netG.parameters(), lr=lr, betas=(b1, b2))
-    optD = torch.optim.Adam(self.netD.parameters(), lr=lr, betas=(b1, b2))
-    return [optG, optD], []
-
-  def train_dataloader(self):
-    
-    self.train_data = dataset.DATA(config.TRAIN_DIR)
-    return torch.utils.data.DataLoader(self.train_data, 
-                      batch_size=self.hparams.batch_size)
-
-  def on_epoch_end(self):
-    i=1
-    utils.plot_some(self.train_data, self.netG, i)
-    i+=1
-
-    # for param in self.netD.parameters():
-    #   param.requires_grad= False
-    
-    # predAB, classVector = self.netG(trainL_3)
-    # predLAB = torch.cat([trainL, predAB], dim=1)
-    # discpred = self.netD(predLAB)
-
-    # return predAB, classVector, discpred
-
-if __name__=='__main__':
-  from argparse import Namespace
-  from pytorch_lightning.callbacks import ModelCheckpoint
-  import config
-  args = {
-      'batch_size': 2,
-      'lr': 0.0002,
-      'b1': 0.5,
-      'b2': 0.999
-  }
-  hparams = Namespace(**args)
-  gan_model = GAN(hparams)
-
-  # most basic trainer, uses good defaults (1 gpu)
-  checkpoint_callback = ModelCheckpoint(filepath=config.CHECKPOINT_DIR, save_top_k=-1,verbose=True, monitor='Loss_G')
-  trainer = pl.Trainer(logger=False,checkpoint_callback=checkpoint_callback,max_epochs=10,default_save_path=config.CHECKPOINT_DIR)    
-  trainer.fit(gan_model)   
 
   
 
